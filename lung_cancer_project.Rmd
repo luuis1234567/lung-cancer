@@ -1,0 +1,501 @@
+---
+title: "lung_cancer_project"
+author: "Yi Chou"
+date: "2025-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# 安装和加载所需包
+library(Seurat)
+library(SeuratData)
+library(dplyr)
+library(ggplot2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(patchwork)
+```
+
+```{r}
+# 1. 读取原始 UMI 表达矩阵
+umi_matrix <- readRDS("GSE131907_Lung_Cancer_raw_UMI_matrix.rds")
+
+# 2. 检查矩阵结构（应该是稀疏矩阵，每行是基因，每列是细胞）
+str(umi_matrix)
+
+# 2.5 随机抽取 10000 个细胞（列）
+set.seed(2024)  # 保证每次结果一致
+all_cells <- colnames(umi_matrix)
+sampled_cells <- sample(all_cells, 10000)
+umi_sub <- umi_matrix[, sampled_cells]
+
+# 3. 创建 Seurat 对象
+library(Seurat)
+seurat_obj <- CreateSeuratObject(counts = umi_sub, min.cells = 3, min.features = 200)
+
+# 4. 加载细胞注释
+anno <- read.table("GSE131907_Lung_Cancer_cell_annotation.txt", header = TRUE, sep = "\t", row.names = 1)
+
+# 5. 只保留抽取到的细胞的注释
+anno_sub <- anno[sampled_cells, , drop=FALSE]
+
+# 6. 添加注释到 Seurat 元数据
+seurat_obj <- AddMetaData(seurat_obj, metadata = anno_sub)
+```
+
+
+```{r}
+# 计算线粒体比例（以 "MT-" 或 "mt-" 开头的基因）
+seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^MT-|^mt-")
+
+# 画 QC 指标小提琴图
+VlnPlot(seurat_obj, features = c("nFeature_RNA"), ncol = 1)
+VlnPlot(seurat_obj, features = c("nCount_RNA"), ncol = 1)
+VlnPlot(seurat_obj, features = c("percent.mt"), ncol = 1)
+
+# 质控过滤（常用标准，可视情况调整）
+seurat_obj <- subset(seurat_obj, 
+                     subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 10)
+
+# 标准化
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+
+# 降维分析
+seurat_obj <- RunPCA(seurat_obj)
+ElbowPlot(seurat_obj)  # 可辅助选主成分数
+
+# 聚类和 UMAP
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:20)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:20)
+
+# UMAP可视化
+DimPlot(seurat_obj, group.by = "Cell_type")  # 如果注释表有 celltype 字段
+```
+
+```{r fig.width=12, fig.height=10}
+DimPlot(seurat_obj, group.by = "Cell_subtype", label = TRUE)
+```
+
+
+```{r}
+# 设置分组依据为 Cell_type
+Idents(seurat_obj) <- seurat_obj$Cell_type
+
+# 查看所有分组名
+levels(seurat_obj)
+
+markers <- FindMarkers(seurat_obj, ident.1 = "Epithelial cells", ident.2 = "Myeloid cells")
+head(markers)
+```
+
+
+```{r}
+if (!requireNamespace("EnhancedVolcano", quietly = TRUE))
+  BiocManager::install("EnhancedVolcano")
+
+library(EnhancedVolcano)
+
+EnhancedVolcano(markers,
+                lab = rownames(markers),
+                x = 'avg_log2FC',
+                y = 'p_val_adj',
+                pCutoff = 0.05,
+                FCcutoff = 0.5,
+                title = "Epithelial vs Myeloid cells",
+                subtitle = "Marker gene volcano plot",
+                pointSize = 2.0,
+                labSize = 2.0)
+```
+```{r}
+# 选前10个上调基因
+top_markers <- rownames(head(markers[order(-markers$avg_log2FC), ], 10))
+
+# 画热图
+DoHeatmap(seurat_obj, features = top_markers, group.by = "Cell_type", label = TRUE)
+```
+
+
+```{r}
+# 选取第1个marker
+FeaturePlot(seurat_obj, features = top_markers[1])
+VlnPlot(seurat_obj, features = top_markers[1], group.by = "Cell_type")
+```
+
+
+```{r}
+# 提取上调marker（以Epithelial cells为例）
+up_genes <- rownames(markers)[markers$avg_log2FC > 0.5 & markers$p_val_adj < 0.05]
+length(up_genes)  # 看看数量
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+gene.df <- bitr(up_genes, 
+                fromType = "SYMBOL", 
+                toType = "ENTREZID", 
+                OrgDb = org.Hs.eg.db)
+
+ego <- enrichGO(gene = gene.df$ENTREZID,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                ont = "BP",  # Biological Process
+                pAdjustMethod = "BH",
+                qvalueCutoff = 0.05)
+
+# KEGG富集，通常需要把基因ID转成字符型
+ekegg <- enrichKEGG(gene = as.character(gene.df$ENTREZID),
+                    organism = "hsa",   # 人类
+                    pAdjustMethod = "BH",
+                    qvalueCutoff = 0.05)
+
+```
+
+
+```{r}
+# GO 富集结果可视化
+dotplot(ego, showCategory = 15, title = "GO BP Enrichment")
+
+# KEGG 富集结果可视化
+dotplot(ekegg, showCategory = 15, title = "KEGG Pathway Enrichment")
+
+```
+
+
+```{r}
+head(ego)    # GO
+head(ekegg)  # KEGG
+```
+
+```{r}
+library(SeuratWrappers)
+library(monocle3)
+# Seurat对象转换为cell_data_set对象
+cds <- as.cell_data_set(seurat_obj)
+cds <- cluster_cells(cds)
+
+
+# 保留聚类和UMAP信息
+cds@clusters$UMAP <- seurat_obj@reductions$umap@cell.embeddings
+cds@int_colData@listData$reducedDims <- list(UMAP = seurat_obj@reductions$umap@cell.embeddings)
+```
+
+
+```{r}
+# 找到Epithelial cells的任一细胞ID作为root
+root_cells <- rownames(subset(colData(cds), Cell_type == "Epithelial cells"))
+root_cell <- root_cells[1]
+```
+
+
+```{r}
+# 构建trajectory graph
+cds <- cluster_cells(cds)
+cds <- learn_graph(cds)
+
+# 指定root细胞进行拟时序排序
+cds <- order_cells(cds, root_cells = root_cell)
+```
+
+
+```{r}
+# 可视化轨迹结构（按分群）
+plot_cells(cds,
+           color_cells_by = "Cell_type",
+           show_trajectory_graph = TRUE)
+
+# 可视化拟时序
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           show_trajectory_graph = TRUE)
+
+```
+```{r}
+library(CellChat)
+```
+
+
+```{r}
+# 提取表达矩阵和meta信息
+data.input <- GetAssayData(seurat_obj, slot = "data")   # 标准化后的表达矩阵
+meta.data <- seurat_obj@meta.data
+
+# 构建 CellChat 对象
+cellchat <- createCellChat(object = data.input, meta = meta.data, group.by = "Cell_type")
+
+# 选择物种数据库（人类用CellChatDB.human，鼠用CellChatDB.mouse）
+CellChatDB <- CellChatDB.human
+cellchat@DB <- CellChatDB
+
+```
+
+```{r}
+# 提取表达矩阵和meta信息
+data.input <- GetAssayData(seurat_obj, slot = "data")   # 标准化后的表达矩阵
+meta.data <- seurat_obj@meta.data
+
+# 构建 CellChat 对象
+cellchat <- createCellChat(object = data.input, meta = meta.data, group.by = "Cell_type")
+
+# 选择物种数据库（人类用CellChatDB.human，鼠用CellChatDB.mouse）
+CellChatDB <- CellChatDB.human
+cellchat@DB <- CellChatDB
+```
+```{r}
+cellchat <- subsetData(cellchat)            # 预处理
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- computeCommunProb(cellchat)     # 计算通讯概率
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+```
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, 
+                 weight.scale = T, label.edge= F, title.name = "Number of interactions")
+```
+```{r}
+cellchat@netP$pathways
+```
+
+
+```{r}
+netVisual_bubble(cellchat, signaling = "CXCL")
+netVisual_bubble(cellchat, signaling = "CD99")
+netVisual_bubble(cellchat, signaling = "THBS")
+```
+
+
+```{r}
+netVisual_heatmap(cellchat, signaling = "MIF")
+netVisual_heatmap(cellchat, signaling = "SELPLG")
+netVisual_heatmap(cellchat, signaling = "TWEAK")
+```
+
+```{r}
+# 以 MIF 通路为例
+netAnalysis_contribution(cellchat, signaling = "MIF")
+netAnalysis_contribution(cellchat, signaling = "CXCL")
+netAnalysis_contribution(cellchat, signaling = "COLLAGEN")
+```
+
+
+```{r}
+cellchat <- netAnalysis_computeCentrality(cellchat)
+
+
+# 分析 MIF 通路各细胞类型的发送和接收角色
+netAnalysis_signalingRole_network(cellchat, signaling = "MIF")
+netAnalysis_signalingRole_network(cellchat, signaling = "FN1")
+netAnalysis_signalingRole_network(cellchat, signaling = "VEGF")
+```
+```{r}
+library(copykat)
+# 提取 counts 矩阵
+set.seed(2024) # 保证复现
+sample_cells <- sample(colnames(seurat_obj), 2000)
+expr_sub <- as.matrix(GetAssayData(seurat_obj, slot = "counts")[, sample_cells])
+```
+
+
+```{r}
+# 1. 检查可用细胞数
+n_cells <- ncol(seurat_obj)
+n_sample <- min(1000, n_cells)
+
+# 2. 抽样
+set.seed(2024)
+sample_cells <- sample(colnames(seurat_obj), n_sample)
+
+# 3. 构建表达矩阵
+expr_sub <- as.matrix(GetAssayData(seurat_obj, slot = "counts")[, sample_cells])
+
+# 4. 检查抽样后矩阵维度
+dim(expr_sub)
+
+# 5. （可选）去掉全为 0 的基因
+expr_sub <- expr_sub[rowSums(expr_sub) > 0, ]
+
+# 6. 再次检查
+dim(expr_sub)
+
+# 7. 运行 CopyKAT
+copykat.results <- copykat(
+  rawmat = expr_sub,
+  id.type = "S",
+  ngene.chr = 5,
+  win.size = 25,
+  sam.name = "lung_cancer",
+  distance = "euclidean",
+  norm.cell.names = NULL,
+  output.seg = TRUE,
+  n.cores = 1
+)
+```
+
+
+```{r}
+head(copykat.results$prediction)
+table(copykat.results$prediction)   # 查看恶性/正常细胞数量
+```
+
+
+```{r}
+# 生成一个命名向量（cell.name 为名，copykat.pred 为值）
+copykat_pred <- copykat.results$prediction$copykat.pred
+names(copykat_pred) <- copykat.results$prediction$cell.names
+
+# 写入 Seurat meta.data
+seurat_obj$copykat.pred <- NA
+seurat_obj$copykat.pred[names(copykat_pred)] <- copykat_pred
+DimPlot(seurat_obj, group.by = "copykat.pred", pt.size = 0.5) +
+  ggplot2::ggtitle("CopyKAT CNV: Malignant vs Normal Cells")
+```
+
+
+```{r}
+table_stat <- table(seurat_obj$Cell_type, seurat_obj$copykat.pred)
+prop_stat <- prop.table(table_stat, margin = 1)  # 按细胞类型行求比例
+
+# 打印数量和比例表
+table_stat
+round(prop_stat, 3)
+```
+
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# 转成长表
+df <- as.data.frame(table(seurat_obj$Cell_type, seurat_obj$copykat.pred))
+colnames(df) <- c("Cell_type", "CNV_status", "Freq")
+
+ggplot(df, aes(x = Cell_type, y = Freq, fill = CNV_status)) +
+  geom_bar(stat = "identity", position = "fill") + # position="fill"为百分比堆叠
+  labs(y = "Proportion", x = "Cell Type", fill = "CNV Status", 
+       title = "Proportion of CNV Status in Each Cell Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+# 只选Epithelial cells
+sub <- subset(seurat_obj, subset = Cell_type == "Epithelial cells")
+
+# 以copykat.pred为分组
+Idents(sub) <- sub$copykat.pred
+
+# 做差异分析
+markers_cnv <- FindMarkers(sub, ident.1 = "aneuploid", ident.2 = "diploid")
+head(markers_cnv)
+
+```
+
+```{r}
+VlnPlot(sub, features = c("EPCAM", "KRT8", "KRT18"), group.by = "copykat.pred", pt.size = 0.1)
+
+```
+
+
+```{r}
+table(seurat_obj$Cell_subtype, seurat_obj$copykat.pred)
+
+# 可视化：不同亚群的恶性/正常比例
+library(ggplot2)
+df2 <- as.data.frame(table(seurat_obj$Cell_subtype, seurat_obj$copykat.pred))
+colnames(df2) <- c("Cell_subtype", "CNV_status", "Freq")
+ggplot(df2, aes(x = Cell_subtype, y = Freq, fill = CNV_status)) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(y = "Proportion", x = "Cell Subtype", fill = "CNV Status") +
+  coord_flip() +
+  theme(
+    axis.text.y = element_text(size = 8)
+  )
+```
+
+```{r}
+table(seurat_obj$seurat_clusters)  # 统计每个聚类数
+print("------------------------------------------------------------------------------------------")
+table(seurat_obj$Cell_type)               # 按主类分组
+print("------------------------------------------------------------------------------------------")
+table(seurat_obj$Cell_subtype)            # 按亚群分组
+print("------------------------------------------------------------------------------------------")
+
+# 计算占比（以Cell_subtype为例）
+cell_counts <- table(seurat_obj$Cell_subtype)
+cell_props <- prop.table(cell_counts)
+round(sort(cell_props), 4)   # 排序，展示最稀有亚群
+```
+
+
+```{r}
+# 找出稀有亚群名
+rare_types <- names(cell_props[cell_props < 0.005])
+Idents(seurat_obj) <- seurat_obj$Cell_subtype
+for (rare_id in rare_types) {
+  print(
+    DimPlot(seurat_obj, 
+            cells.highlight = WhichCells(seurat_obj, idents = rare_id),
+            cols.highlight = "red", pt.size = 1, group.by = "Cell_subtype") +
+    ggtitle(paste("Highlight rare subtype:", rare_id))
+  )
+}
+```
+```{r}
+rare_types
+print("----------------------------------------------")
+rare_id
+```
+
+```{r}
+library(RaceID)
+
+# 构建 RaceID 对象
+sc <- SCseq(expr_sub)
+
+# 过滤低质量细胞/基因
+sc <- filterdata(sc, mintotal = 1000, minexpr = 5, minnumber = 5)
+
+# 直接进入距离和聚类，不需要单独 normalize
+sc <- compdist(sc)
+sc <- clustexp(sc)
+
+# tSNE降维
+sc <- comptsne(sc)
+
+# 识别稀有细胞
+sc <- findoutliers(sc)
+
+# 提取稀有细胞概率
+outlier_probs <- unlist(sc@outlierpar)
+rare_cells <- names(outlier_probs[outlier_probs > 0.9])
+length(rare_cells)
+head(rare_cells)
+# tSNE 坐标
+tsne_coords <- sc@tsne
+
+# 构建数据框
+df_tsne <- data.frame(tsne1 = tsne_coords[, 1],
+                      tsne2 = tsne_coords[, 2],
+                      is_rare = colnames(tsne_coords) %in% rare_cells)
+
+library(ggplot2)
+ggplot(df_tsne, aes(x = tsne1, y = tsne2, color = is_rare)) +
+  geom_point(size = 1) +
+  labs(title = "tSNE highlighting rare (outlier) cells")
+```
+
+
+
+
+
+
+
